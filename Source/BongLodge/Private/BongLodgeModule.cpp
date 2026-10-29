@@ -13,6 +13,7 @@
 #include "Internationalization/Regex.h"
 #if PLATFORM_WINDOWS
 #include "Windows/WindowsApplication.h"
+#include "HAL/PlatformStackWalk.h"
 #include "Windows/AllowWindowsPlatformTypes.h"
 #endif
 
@@ -25,6 +26,18 @@ public:
 	struct FTarget { RECT Rect; bool bMaximized; double Until; };
 	TMap<HWND, FTarget> Targets;
 	static inline bool bOwnChange = false;
+	// Minimized targets: rects (as created from layout/RootWindow) whose first show is suppressed so the
+	// window never paints in normal state; BongLodge then shows it directly as minimized.
+	TArray<RECT> PendingMinRects;
+	TSet<HWND> SuppressedShow;
+	TSet<HWND> SeenShow;
+	double DiagUntil = 0.0;
+
+	static bool RectNear(const RECT& A, const RECT& B, int32 Tol)
+	{
+		return FMath::Abs((int32)(A.left - B.left)) <= Tol && FMath::Abs((int32)(A.top - B.top)) <= Tol
+			&& FMath::Abs((int32)(A.right - B.right)) <= Tol && FMath::Abs((int32)(A.bottom - B.bottom)) <= Tol;
+	}
 
 	virtual bool ProcessMessage(HWND Hwnd, uint32 Msg, WPARAM WParam, LPARAM LParam, int32& OutResult) override
 	{
@@ -32,6 +45,40 @@ public:
 		{
 			Targets.Remove(Hwnd); // user starts dragging: stop guarding this window
 			return false;
+		}
+		if (Msg == WM_SIZE && WParam == SIZE_RESTORED && FPlatformTime::Seconds() < DiagUntil && !bOwnChange)
+		{
+			if (const FTarget* DT = Targets.Find(Hwnd))
+			{
+				if (DT->bMaximized)
+				{
+					ANSICHAR Stack[8192]; Stack[0] = 0;
+					FPlatformStackWalk::StackWalkAndDump(Stack, UE_ARRAY_COUNT(Stack), 0);
+					UE_LOG(LogBongLodgeGuard, Log, TEXT("Maximized target got SIZE_RESTORED by someone else:\n%s"), ANSI_TO_TCHAR(Stack));
+				}
+			}
+		}
+		if (Msg == WM_WINDOWPOSCHANGING && !bOwnChange && PendingMinRects.Num() > 0 && !SeenShow.Contains(Hwnd))
+		{
+			WINDOWPOS* SP = reinterpret_cast<WINDOWPOS*>(LParam);
+			if (SP && (SP->flags & SWP_SHOWWINDOW) && !::IsWindowVisible(Hwnd))
+			{
+				SeenShow.Add(Hwnd);
+				RECT Cur; ::GetWindowRect(Hwnd, &Cur);
+				RECT New = Cur;
+				if (!(SP->flags & SWP_NOMOVE)) { New.left = SP->x; New.top = SP->y; New.right = SP->x + (Cur.right - Cur.left); New.bottom = SP->y + (Cur.bottom - Cur.top); }
+				if (!(SP->flags & SWP_NOSIZE)) { New.right = New.left + SP->cx; New.bottom = New.top + SP->cy; }
+				for (const RECT& R : PendingMinRects)
+				{
+					if (RectNear(R, New, 16))
+					{
+						SP->flags &= ~SWP_SHOWWINDOW;
+						SuppressedShow.Add(Hwnd);
+						UE_LOG(LogBongLodgeGuard, Log, TEXT("Suppressed first show of window to be minimized (%d,%d)"), (int32)New.left, (int32)New.top);
+						break;
+					}
+				}
+			}
 		}
 		if (Msg != WM_WINDOWPOSCHANGING || Targets.Num() == 0)
 		{
@@ -91,6 +138,8 @@ public:
 class FBongLodgeMessageGuard {};
 #endif
 #include "Misc/Paths.h"
+#include "Styling/CoreStyle.h"
+#include "Styling/SlateTypes.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonWriter.h"
@@ -99,6 +148,15 @@ class FBongLodgeMessageGuard {};
 DEFINE_LOG_CATEGORY_STATIC(LogBongLodge, Log, All);
 
 #define BONGLODGE_ROOT_KEY TEXT("Root")
+
+/** SWindow (no OS border) adds LayoutBorder*DPI to the client size it is constructed with, but the
+ *  engine saves (window - LayoutBorder)/DPI. Convert a physical window size into the exact client
+ *  size (DPI-independent) that makes SWindow::Construct produce that window size. */
+static FVector2D BongLodgeClientSizeFor(int32 W, int32 H, float Dpi)
+{
+	const FMargin Border = FCoreStyle::Get().GetWidgetStyle<FWindowStyle>("Window").BorderPadding;
+	return FVector2D(W / (double)Dpi - (Border.Left + Border.Right), H / (double)Dpi - (Border.Top + Border.Bottom));
+}
 
 static FString BongLodgeFilePath()
 {
@@ -124,6 +182,16 @@ void FBongLodgeModule::StartupModule()
 	{
 		MessageGuard = MakeUnique<FBongLodgeMessageGuard>();
 		static_cast<FWindowsApplication*>(PlatformApp.Get())->AddMessageHandler(*MessageGuard);
+		MessageGuard->DiagUntil = TNumericLimits<double>::Max();
+		for (const auto& Pair : Placements)
+		{
+			if (Pair.Value.bMinimized)
+			{
+				FBongLodgePlacement P = Pair.Value;
+				FitToMonitors(P);
+				MessageGuard->PendingMinRects.Add({ P.X, P.Y, P.X + P.W, P.Y + P.H });
+			}
+		}
 	}
 #endif
 	DpiHandle = App.OnSystemSignalsDPIChanged().AddRaw(this, &FBongLodgeModule::OnSystemDPIChanged);
@@ -362,8 +430,21 @@ void FBongLodgeModule::ApplyFitted(const TSharedRef<SWindow>& Window, const FBon
 	}
 	else if (P.bMinimized)
 	{
-		Window->Minimize();
+		MinimizeNative(Window);
 	}
+}
+
+void FBongLodgeModule::MinimizeNative(const TSharedRef<SWindow>& Window)
+{
+#if PLATFORM_WINDOWS
+	TGuardValue<bool> OwnChange(FBongLodgeMessageGuard::bOwnChange, true);
+	if (TSharedPtr<FGenericWindow> Native = Window->GetNativeWindow())
+	{
+		::ShowWindow((HWND)Native->GetOSWindowHandle(), SW_SHOWMINNOACTIVE);
+		return;
+	}
+#endif
+	Window->Minimize();
 }
 
 void FBongLodgeModule::Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& InP, bool bStartEnforce)
@@ -387,9 +468,35 @@ void FBongLodgeModule::Apply(const TSharedRef<SWindow>& Window, const FBongLodge
 			bAlreadyThere = FMath::Abs(Cur.X - P.X) <= 2 && FMath::Abs(Cur.Y - P.Y) <= 2 && FMath::Abs(Cur.W - P.W) <= 1 && FMath::Abs(Cur.H - P.H) <= 1;
 		}
 	}
+	const FVector2D WPos0 = Window->GetPositionInScreen();
+	const FVector2D WSize0 = Window->GetSizeInScreen();
+	const bool bSameMonitor = BongLodgeMonitorIndex((int32)WPos0.X, (int32)WPos0.Y, (int32)WSize0.X, (int32)WSize0.Y) == BongLodgeMonitorIndex(P.X, P.Y, P.W, P.H);
 	if (bAlreadyThere)
 	{
 		UE_LOG(LogBongLodge, Log, TEXT("Already at target, no reshape needed"));
+	}
+	else if (P.bMinimized && bSameMonitor)
+	{
+		// created at the right rect (hidden by the guard): show it straight as minimized
+		MinimizeNative(Window);
+	}
+	else if (P.bMaximized && bSameMonitor && !Cur.bMinimized)
+	{
+		// created on the right monitor: only the state is missing (or will be set by InitialMaximize)
+#if PLATFORM_WINDOWS
+		TSharedPtr<FGenericWindow> Native = Window->GetNativeWindow();
+		const bool bVisible = Native.IsValid() && ::IsWindowVisible((HWND)Native->GetOSWindowHandle());
+#else
+		const bool bVisible = true;
+#endif
+		if (bVisible && !Window->IsWindowMaximized())
+		{
+#if PLATFORM_WINDOWS
+			TGuardValue<bool> OwnChange(FBongLodgeMessageGuard::bOwnChange, true);
+#endif
+			Window->Maximize();
+		}
+		UE_LOG(LogBongLodge, Log, TEXT("Maximized target on right monitor, state only (visible=%d)"), bVisible);
 	}
 	else
 	{
@@ -442,6 +549,9 @@ bool FBongLodgeModule::IsEnforced(const SWindow* Window) const
 void FBongLodgeModule::OnMainFrameCreated(TSharedPtr<SWindow> Root, bool bNewProjectWindow)
 {
 	StartupGraceUntil = FPlatformTime::Seconds() + 8.0;
+#if PLATFORM_WINDOWS
+	if (MessageGuard.IsValid()) { MessageGuard->DiagUntil = StartupGraceUntil; }
+#endif
 	if (!Root.IsValid() || bNewProjectWindow)
 	{
 		return;
@@ -519,6 +629,23 @@ void FBongLodgeModule::OnPreTick(float Dt)
 	}
 	PendingDpiFix.Reset();
 
+#if PLATFORM_WINDOWS
+	if (MessageGuard.IsValid() && MessageGuard->SuppressedShow.Num() > 0 && FPlatformTime::Seconds() > StartupGraceUntil - 6.0)
+	{
+		// safety net: never leave a window hidden (e.g. it turned out not to be ours to minimize)
+		for (HWND H : MessageGuard->SuppressedShow)
+		{
+			if (::IsWindow(H) && !::IsWindowVisible(H))
+			{
+				UE_LOG(LogBongLodgeGuard, Log, TEXT("Showing a suppressed window that was not minimized"));
+				::ShowWindow(H, SW_SHOWNA);
+			}
+		}
+		MessageGuard->SuppressedShow.Reset();
+		MessageGuard->PendingMinRects.Reset();
+	}
+#endif
+
 	const double NowE = FPlatformTime::Seconds();
 	for (int32 i = Enforced.Num() - 1; i >= 0; --i)
 	{
@@ -565,6 +692,10 @@ void FBongLodgeModule::OnPreTick(float Dt)
 				TGuardValue<bool> OwnChange(FBongLodgeMessageGuard::bOwnChange, true);
 #endif
 				W->Maximize();
+			}
+			else if (E.Target.bMinimized && !Cur.bMaximized)
+			{
+				MinimizeNative(W.ToSharedRef());
 			}
 			else
 			{
@@ -735,8 +866,9 @@ FString FBongLodgeModule::RewriteAreasFromSaved(const FString& Layout) const
 		const FRegexPattern RectPattern(TEXT("\"WindowPosition_X\": [-0-9.e+]+,\"WindowPosition_Y\": [-0-9.e+]+,\"WindowSize_X\": [-0-9.e+]+,\"WindowSize_Y\": [-0-9.e+]+,\"bIsMaximized\": (true|false)"));
 		FRegexMatcher RM(RectPattern, Area);
 		if (!RM.FindNext()) { continue; }
+		const FVector2D Client = BongLodgeClientSizeFor(P.W, P.H, Dpi);
 		const FString Replacement = FString::Printf(TEXT("\"WindowPosition_X\": %.3f,\"WindowPosition_Y\": %.3f,\"WindowSize_X\": %.3f,\"WindowSize_Y\": %.3f,\"bIsMaximized\": %s"),
-			P.X / Dpi, P.Y / Dpi, P.W / Dpi, P.H / Dpi, P.bMaximized ? TEXT("true") : TEXT("false"));
+			P.X / Dpi, P.Y / Dpi, Client.X, Client.Y, P.bMaximized ? TEXT("true") : TEXT("false"));
 		NewArea = Area.Left(RM.GetMatchBeginning()) + Replacement + Area.Mid(RM.GetMatchEnding());
 		Text = Text.Left(Start) + NewArea + Text.Mid(End + 1);
 		Search = Start + NewArea.Len();
@@ -760,7 +892,7 @@ void FBongLodgeModule::PrepareConfigBeforeLayoutLoad()
 		FitToMonitors(P);
 		const float Dpi = FMath::Max(0.5f, FPlatformApplicationMisc::GetDPIScaleFactorAtPoint(P.X + P.W * 0.5f, P.Y + P.H * 0.5f));
 		const FVector2D Pos(P.X / Dpi, P.Y / Dpi);
-		const FVector2D Size(P.W / Dpi, P.H / Dpi);
+		const FVector2D Size = BongLodgeClientSizeFor(P.W, P.H, Dpi);
 		GConfig->SetString(TEXT("RootWindow"), TEXT("ScreenPosition"), *Pos.ToString(), GEditorPerProjectIni);
 		GConfig->SetString(TEXT("RootWindow"), TEXT("WindowSize"), *Size.ToString(), GEditorPerProjectIni);
 		GConfig->SetBool(TEXT("RootWindow"), TEXT("InitiallyMaximized"), P.bMaximized, GEditorPerProjectIni);

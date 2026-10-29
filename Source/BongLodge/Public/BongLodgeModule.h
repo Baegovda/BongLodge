@@ -49,6 +49,7 @@ private:
 	FString GetWindowKey(const TSharedRef<SWindow>& Window) const;
 	bool Capture(const TSharedRef<SWindow>& Window, FBongLodgePlacement& Out) const;
 	void Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P, bool bStartEnforce = true);
+	static void MinimizeNative(const TSharedRef<SWindow>& Window);
 	static void ApplyFitted(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P);
 	static void FitToMonitors(FBongLodgePlacement& P);
 
