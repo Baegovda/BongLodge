@@ -24,6 +24,7 @@ class FBongLodgeMessageGuard : public IWindowsMessageHandler
 public:
 	struct FTarget { RECT Rect; bool bMaximized; double Until; };
 	TMap<HWND, FTarget> Targets;
+	static inline bool bOwnChange = false;
 
 	virtual bool ProcessMessage(HWND Hwnd, uint32 Msg, WPARAM WParam, LPARAM LParam, int32& OutResult) override
 	{
@@ -56,13 +57,32 @@ public:
 		const int32 W = (Pos->flags & SWP_NOSIZE) ? (Cur.right - Cur.left) : Pos->cx;
 		const int32 H = (Pos->flags & SWP_NOSIZE) ? (Cur.bottom - Cur.top) : Pos->cy;
 		RECT New = { Pos->x, Pos->y, Pos->x + W, Pos->y + H };
+		if (bOwnChange)
+		{
+			return false; // BongLodge itself is placing the window
+		}
 		const HMONITOR TargetMon = ::MonitorFromRect(&T->Rect, MONITOR_DEFAULTTONULL);
 		const HMONITOR NewMon = ::MonitorFromRect(&New, MONITOR_DEFAULTTONULL);
-		if (TargetMon == nullptr || NewMon == TargetMon)
+		if (TargetMon == nullptr)
 		{
-			return false; // same monitor (our own placement, maximize, small adjustments): allow
+			return false;
 		}
-		UE_LOG(LogBongLodgeGuard, Log, TEXT("Blocked startup move of window to (%d,%d %dx%d) on another monitor"), Pos->x, Pos->y, W, H);
+		const auto Near = [](LONG A, LONG B) { return FMath::Abs((int32)A - (int32)B) <= 2; };
+		if (T->bMaximized)
+		{
+			// allow only "maximized on the target monitor" (rect covers that monitor's work area)
+			MONITORINFO MI; MI.cbSize = sizeof(MI);
+			if (NewMon == TargetMon && ::GetMonitorInfo(TargetMon, &MI)
+				&& New.left <= MI.rcWork.left + 12 && New.top <= MI.rcWork.top + 12 && New.right >= MI.rcWork.right - 12 && New.bottom >= MI.rcWork.bottom - 12)
+			{
+				return false;
+			}
+		}
+		else if (NewMon == TargetMon && Near(New.left, T->Rect.left) && Near(New.top, T->Rect.top) && Near(New.right, T->Rect.right) && Near(New.bottom, T->Rect.bottom))
+		{
+			return false; // (almost) exactly the target rect
+		}
+		UE_LOG(LogBongLodgeGuard, Log, TEXT("Blocked startup move of window to (%d,%d %dx%d)"), Pos->x, Pos->y, W, H);
 		Pos->flags |= SWP_NOMOVE | SWP_NOSIZE;
 		return false; // let default processing continue with the neutralised WINDOWPOS
 	}
@@ -200,8 +220,11 @@ bool FBongLodgeModule::Capture(const TSharedRef<SWindow>& Window, FBongLodgePlac
 	Out.bMaximized = Window->IsWindowMaximized();
 	Out.bMinimized = Window->IsWindowMinimized();
 
+	// Normal state: use the real current rect. (GetRestoredDimensions returns rcNormalPosition, which for
+	// an Aero-snapped window, e.g. snapped to the right half, is the PRE-snap rect, not what is on screen.)
+	// Maximized/minimized: use the restored (normal) rect so un-maximizing later gives the right size.
 	int32 X = 0, Y = 0, W = 0, H = 0;
-	if (Native->GetRestoredDimensions(X, Y, W, H) && W > 0 && H > 0)
+	if ((Out.bMaximized || Out.bMinimized) && Native->GetRestoredDimensions(X, Y, W, H) && W > 0 && H > 0)
 	{
 		Out.X = X; Out.Y = Y; Out.W = W; Out.H = H;
 	}
@@ -211,6 +234,20 @@ bool FBongLodgeModule::Capture(const TSharedRef<SWindow>& Window, FBongLodgePlac
 		const FVector2D Size = Window->GetSizeInScreen();
 		Out.X = FMath::RoundToInt(Pos.X); Out.Y = FMath::RoundToInt(Pos.Y);
 		Out.W = FMath::RoundToInt(Size.X); Out.H = FMath::RoundToInt(Size.Y);
+#if PLATFORM_WINDOWS
+		// Slate's cached position can be stale/mis-scaled after a move done outside Slate
+		// (observed: window at x=-1920 reported as -960). Ask Windows for the real rect.
+		RECT R;
+		// Query in per-monitor-v2 context so the rect is in true physical virtual-screen coordinates.
+		const DPI_AWARENESS_CONTEXT PrevCtx = ::SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		const BOOL bGot = ::GetWindowRect((HWND)Native->GetOSWindowHandle(), &R);
+		if (PrevCtx) { ::SetThreadDpiAwarenessContext(PrevCtx); }
+		UE_LOG(LogBongLodge, Verbose, TEXT("Capture slate=(%d,%d) win32=(%d,%d)"), Out.X, Out.Y, (int32)R.left, (int32)R.top);
+		if (bGot && R.right > R.left)
+		{
+			Out.X = R.left; Out.Y = R.top; Out.W = R.right - R.left; Out.H = R.bottom - R.top;
+		}
+#endif
 	}
 	if (Out.W < 50 || Out.H < 50)
 	{
@@ -308,6 +345,9 @@ void FBongLodgeModule::ApplyFitted(const TSharedRef<SWindow>& Window, const FBon
 		Window->Restore();
 	}
 	// Physical virtual-desktop pixels, same space as SWindow::GetPositionInScreen.
+#if PLATFORM_WINDOWS
+	TGuardValue<bool> OwnChange(FBongLodgeMessageGuard::bOwnChange, true);
+#endif
 	Window->ReshapeWindow(FVector2D(P.X, P.Y), FVector2D(P.W, P.H));
 	// Moving across monitors with different DPI makes Windows rescale the window (WM_DPICHANGED),
 	// so set the exact rect once more now that it is on the target monitor.
@@ -434,7 +474,11 @@ static void BongLodgeKeepNormalRect(const TSharedRef<SWindow>& Window, FBongLodg
 		return;
 	}
 	const FVector2D Size = Window->GetSizeInScreen();
-	if (Cur.W >= Size.X - 24 && Cur.H >= Size.Y - 24)
+	const bool bLooksLikeMaxRect = Cur.W >= Size.X - 24 && Cur.H >= Size.Y - 24;
+	// the restored rect of a window that stayed maximized drifts by a few border pixels per launch
+	const bool bJustBorderDrift = FMath::Abs(Cur.X - Old->X) <= 24 && FMath::Abs(Cur.Y - Old->Y) <= 24
+		&& FMath::Abs(Cur.W - Old->W) <= 24 && FMath::Abs(Cur.H - Old->H) <= 24;
+	if (bLooksLikeMaxRect || bJustBorderDrift)
 	{
 		Cur.X = Old->X; Cur.Y = Old->Y; Cur.W = Old->W; Cur.H = Old->H; Cur.Dpi = Old->Dpi;
 	}
@@ -511,7 +555,21 @@ void FBongLodgeModule::OnPreTick(float Dt)
 		if (bOff)
 		{
 			UE_LOG(LogBongLodge, Log, TEXT("Window was moved by someone else to (%d,%d max=%d) during startup, re-applying (%d,%d)"), Cur.X, Cur.Y, Cur.bMaximized, E.Target.X, E.Target.Y);
-			ApplyFitted(W.ToSharedRef(), E.Target);
+			const FVector2D WPos = W->GetPositionInScreen();
+			const FVector2D WSize = W->GetSizeInScreen();
+			if (E.Target.bMaximized && !Cur.bMinimized
+				&& BongLodgeMonitorIndex((int32)WPos.X, (int32)WPos.Y, (int32)WSize.X, (int32)WSize.Y) == BongLodgeMonitorIndex(E.Target.X, E.Target.Y, E.Target.W, E.Target.H))
+			{
+				// only the maximized flag got lost, the window is on the right monitor: just re-maximize
+#if PLATFORM_WINDOWS
+				TGuardValue<bool> OwnChange(FBongLodgeMessageGuard::bOwnChange, true);
+#endif
+				W->Maximize();
+			}
+			else
+			{
+				ApplyFitted(W.ToSharedRef(), E.Target);
+			}
 			++E.Corrections;
 		}
 	}
@@ -562,11 +620,12 @@ void FBongLodgeModule::OnPreTick(float Dt)
 				FBongLodgePlacement& Old = Placements.FindOrAdd(*Key);
 				if (Old.X != Cur.X || Old.Y != Cur.Y)
 				{
-					UE_LOG(LogBongLodge, Log, TEXT("%s moved to (%d,%d %dx%d max=%d)"), **Key, Cur.X, Cur.Y, Cur.W, Cur.H, Cur.bMaximized);
+					UE_LOG(LogBongLodge, Log, TEXT("%s moved to (%d,%d %dx%d max=%d) slate=(%.0f,%.0f)"), **Key, Cur.X, Cur.Y, Cur.W, Cur.H, Cur.bMaximized, Window->GetPositionInScreen().X, Window->GetPositionInScreen().Y);
 				}
 				if (Old.X != Cur.X || Old.Y != Cur.Y || Old.W != Cur.W || Old.H != Cur.H || Old.bMaximized != Cur.bMaximized || Old.bMinimized != Cur.bMinimized)
 				{
 					Old = Cur;
+					TouchedKeys.Add(*Key);
 					bDirty = true;
 				}
 			}
@@ -589,6 +648,7 @@ void FBongLodgeModule::OnWindowBeingDestroyed(const SWindow& Window)
 		{
 			BongLodgeKeepNormalRect(Ref, Cur, Placements.Find(*Key));
 			Placements.Add(*Key, Cur);
+			TouchedKeys.Add(*Key);
 			Save();
 		}
 		KeyCache.Remove(&Window);
@@ -629,6 +689,60 @@ static bool BongLodgeRectVisible(const FDisplayMetrics& M, int32 X, int32 Y, int
 		if (BongLodgeIntersects(Mon.WorkArea, X, Y, W, H, 100)) { return true; }
 	}
 	return false;
+}
+
+/** Floating areas in a saved layout: overwrite position/size/maximized with BongLodge's saved
+ *  placement for the same set of opened tabs, so the engine creates the window exactly there
+ *  (and its own SW_PARENTOPENING placement cache agrees with us). Values are DPI-independent. */
+FString FBongLodgeModule::RewriteAreasFromSaved(const FString& Layout) const
+{
+	FString Text = Layout;
+	int32 Search = 0;
+	const FString AreaTag = TEXT("\"Type\": \"Area\"");
+	while (true)
+	{
+		const int32 TagPos = Text.Find(AreaTag, ESearchCase::CaseSensitive, ESearchDir::FromStart, Search);
+		if (TagPos == INDEX_NONE) { break; }
+		const int32 Start = Text.Find(TEXT("("), ESearchCase::CaseSensitive, ESearchDir::FromEnd, TagPos);
+		if (Start == INDEX_NONE) { Search = TagPos + 1; continue; }
+		int32 Depth = 0, End = INDEX_NONE;
+		for (int32 i = Start; i < Text.Len(); ++i)
+		{
+			if (Text[i] == TEXT('(')) { ++Depth; }
+			else if (Text[i] == TEXT(')')) { if (--Depth == 0) { End = i; break; } }
+		}
+		if (End == INDEX_NONE) { break; }
+		FString Area = Text.Mid(Start, End - Start + 1);
+		Search = TagPos + 1;
+		if (!Area.Contains(TEXT("Placement_Specified")) || !Area.Contains(TEXT("WindowPosition_X")))
+		{
+			continue;
+		}
+		TArray<FString> Ids;
+		{
+			const FRegexPattern TabPattern(TEXT("\"TabId\": \"([^\"]+)\",\"TabState\": \"OpenedTab\""));
+			FRegexMatcher M(TabPattern, Area);
+			while (M.FindNext()) { Ids.AddUnique(M.GetCaptureGroup(1)); }
+		}
+		if (Ids.Num() == 0) { continue; }
+		Ids.Sort();
+		const FBongLodgePlacement* Saved = Placements.Find(TEXT("Tabs:") + FString::Join(Ids, TEXT("|")));
+		if (!Saved) { continue; }
+		FBongLodgePlacement P = *Saved;
+		FitToMonitors(P);
+		const float Dpi = FMath::Max(0.5f, FPlatformApplicationMisc::GetDPIScaleFactorAtPoint(P.X + P.W * 0.5f, P.Y + P.H * 0.5f));
+		FString NewArea = Area;
+		const FRegexPattern RectPattern(TEXT("\"WindowPosition_X\": [-0-9.e+]+,\"WindowPosition_Y\": [-0-9.e+]+,\"WindowSize_X\": [-0-9.e+]+,\"WindowSize_Y\": [-0-9.e+]+,\"bIsMaximized\": (true|false)"));
+		FRegexMatcher RM(RectPattern, Area);
+		if (!RM.FindNext()) { continue; }
+		const FString Replacement = FString::Printf(TEXT("\"WindowPosition_X\": %.3f,\"WindowPosition_Y\": %.3f,\"WindowSize_X\": %.3f,\"WindowSize_Y\": %.3f,\"bIsMaximized\": %s"),
+			P.X / Dpi, P.Y / Dpi, P.W / Dpi, P.H / Dpi, P.bMaximized ? TEXT("true") : TEXT("false"));
+		NewArea = Area.Left(RM.GetMatchBeginning()) + Replacement + Area.Mid(RM.GetMatchEnding());
+		Text = Text.Left(Start) + NewArea + Text.Mid(End + 1);
+		Search = Start + NewArea.Len();
+		UE_LOG(LogBongLodge, Log, TEXT("Layout area [%s] set to saved (%d,%d %dx%d max=%d)"), *FString::Join(Ids, TEXT("|")), P.X, P.Y, P.W, P.H, P.bMaximized);
+	}
+	return Text;
 }
 
 void FBongLodgeModule::PrepareConfigBeforeLayoutLoad()
@@ -677,8 +791,8 @@ void FBongLodgeModule::PrepareConfigBeforeLayoutLoad()
 	TArray<TPair<FString, FString>> Updates;
 	for (const auto& Pair : *Section)
 	{
-		const FString Original = Pair.Value.GetValue();
-		FString Text = Original;
+		const FString Original = RewriteAreasFromSaved(Pair.Value.GetValue());
+		const bool bRewritten = !Original.Equals(Pair.Value.GetValue(), ESearchCase::CaseSensitive);
 		const FRegexPattern Pattern(TEXT("\"WindowPosition_X\": ([-0-9.e+]+),\"WindowPosition_Y\": ([-0-9.e+]+),\"WindowSize_X\": ([-0-9.e+]+),\"WindowSize_Y\": ([-0-9.e+]+)"));
 		FRegexMatcher Matcher(Pattern, Original);
 		int32 Offset = 0;
@@ -711,6 +825,10 @@ void FBongLodgeModule::PrepareConfigBeforeLayoutLoad()
 		{
 			Out += Original.Mid(Offset);
 			Updates.Add(TPair<FString, FString>(Pair.Key.ToString(), Out));
+		}
+		else if (bRewritten)
+		{
+			Updates.Add(TPair<FString, FString>(Pair.Key.ToString(), Original));
 		}
 	}
 	for (const auto& U : Updates)
@@ -752,6 +870,20 @@ void FBongLodgeModule::Load()
 
 void FBongLodgeModule::Save()
 {
+	// Another editor instance may have written the file meanwhile: keep its entries and only
+	// overwrite the windows this instance actually moved/closed.
+	{
+		TMap<FString, FBongLodgePlacement> Mine = MoveTemp(Placements);
+		Placements.Reset();
+		Load();
+		for (const auto& Pair : Mine)
+		{
+			if (TouchedKeys.Contains(Pair.Key) || !Placements.Contains(Pair.Key))
+			{
+				Placements.Add(Pair.Key, Pair.Value);
+			}
+		}
+	}
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	for (const auto& Pair : Placements)
 	{

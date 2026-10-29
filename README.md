@@ -23,6 +23,10 @@
 
 ---
 
+- 최대화 아님(일반) 상태 창은 화면에 보이는 실제 사각형을 저장합니다(Aero 스냅된 반쪽 크기 포함). 다음 실행 때 최대화로 돌아가지 않습니다.
+- 시작 전에 레이아웃(EditorLayout.ini)의 플로팅 창 위치를 저장값으로 바꾸고, 시작 직후 엔진/Windows가 예전 위치로 옮기려는 시도는 차단합니다.
+- 에디터를 여러 개 띄워도 저장 시 디스크 내용과 병합하므로 다른 창 기록을 덮어쓰지 않습니다.
+
 ## English
 
 BongLodge is an editor-only plugin for UE 5.7. It restores the position, size and maximized/minimized state of the main editor window and of floating tab windows. It doesn't care where the mouse cursor is, it handles mixed-DPI monitors, and if a saved monitor is disconnected it moves the window to the primary monitor.
@@ -32,3 +36,6 @@ Build: `RunUAT.bat BuildPlugin -Plugin=<path>\BongLodge.uplugin -Package=<out> -
 How it avoids flicker: before the main frame is built, the saved root placement is written into the editor's `[RootWindow]` config, so the window is created at the right spot. During the first ~8 s, a Windows message handler (`IWindowsMessageHandler`, `WM_WINDOWPOSCHANGING`) blocks foreign moves of placed windows to another monitor before anything is drawn. Off-screen floating layout areas are pulled onto the primary monitor in memory before the layout loads.
 
 Known limitations: restoring a minimized window still shows it for about 0.15 s first. A floating window that is already maximized may briefly flip its state at the same rectangle while starting up, with no visible move.
+- Normal (non-maximized) windows save the real on-screen rect (including Aero-snapped halves), so they no longer come back maximized.
+- Before layout load, floating areas in EditorLayout.ini are rewritten to the saved rect; stale startup moves by the engine/Windows are blocked.
+- Saves merge with the file on disk, so multiple editor instances don't clobber each other.

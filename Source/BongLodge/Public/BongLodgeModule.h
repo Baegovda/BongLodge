@@ -31,6 +31,7 @@ private:
 	/** Before the main frame / layout is created: feed our saved root placement into [RootWindow]
 	 *  and pull off-screen floating areas of the saved layouts back onto a connected monitor. */
 	void PrepareConfigBeforeLayoutLoad();
+	FString RewriteAreasFromSaved(const FString& Layout) const;
 
 	// Startup: WM_DPICHANGED is deferred by FWindowsApplication and then applied with a stale
 	// suggested rect, which throws freshly placed windows onto another monitor. During startup we
@@ -55,6 +56,7 @@ private:
 	void Save();
 
 	TMap<FString, FBongLodgePlacement> Placements;
+	TSet<FString> TouchedKeys; // keys changed by this editor instance
 	TSet<TWeakPtr<SWindow>> Handled;   // windows already restored / being tracked
 	TMap<const SWindow*, FString> KeyCache;
 
