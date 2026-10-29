@@ -15,6 +15,8 @@
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
+DEFINE_LOG_CATEGORY_STATIC(LogBongLodge, Log, All);
+
 #define BONGLODGE_ROOT_KEY TEXT("Root")
 
 static FString BongLodgeFilePath()
@@ -30,6 +32,7 @@ void FBongLodgeModule::StartupModule()
 		return;
 	}
 	Load();
+	UE_LOG(LogBongLodge, Log, TEXT("BongLodge started, %d saved placements from %s"), Placements.Num(), *BongLodgeFilePath());
 
 	FSlateApplication& App = FSlateApplication::Get();
 	PreTickHandle = App.OnPreTick().AddRaw(this, &FBongLodgeModule::OnPreTick);
@@ -147,6 +150,10 @@ void FBongLodgeModule::FitToMonitors(FBongLodgePlacement& P)
 {
 	FDisplayMetrics Metrics;
 	FDisplayMetrics::RebuildDisplayMetrics(Metrics);
+	for (const FMonitorInfo& M : Metrics.MonitorInfo)
+	{
+		UE_LOG(LogBongLodge, Log, TEXT("Monitor %s primary=%d WA=(%d,%d)-(%d,%d)"), *M.Name, M.bIsPrimary, M.WorkArea.Left, M.WorkArea.Top, M.WorkArea.Right, M.WorkArea.Bottom);
+	}
 	if (Metrics.MonitorInfo.Num() == 0)
 	{
 		return;
@@ -200,17 +207,21 @@ void FBongLodgeModule::FitToMonitors(FBongLodgePlacement& P)
 	P.Y = FMath::Clamp(P.Y, WA.Top, WA.Bottom - P.H);
 }
 
-void FBongLodgeModule::Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& InP)
+void FBongLodgeModule::ApplyFitted(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P)
 {
-	FBongLodgePlacement P = InP;
-	FitToMonitors(P);
-
 	if (Window->IsWindowMaximized() || Window->IsWindowMinimized())
 	{
 		Window->Restore();
 	}
 	// Physical virtual-desktop pixels, same space as SWindow::GetPositionInScreen.
 	Window->ReshapeWindow(FVector2D(P.X, P.Y), FVector2D(P.W, P.H));
+	// Moving across monitors with different DPI makes Windows rescale the window (WM_DPICHANGED),
+	// so set the exact rect once more now that it is on the target monitor.
+	const FVector2D NewSize = Window->GetSizeInScreen();
+	if (FMath::Abs(NewSize.X - P.W) > 2 || FMath::Abs(NewSize.Y - P.H) > 2)
+	{
+		Window->ReshapeWindow(FVector2D(P.X, P.Y), FVector2D(P.W, P.H));
+	}
 	if (P.bMaximized)
 	{
 		Window->Maximize(); // maximizes on the monitor the restored rect is on
@@ -221,6 +232,36 @@ void FBongLodgeModule::Apply(const TSharedRef<SWindow>& Window, const FBongLodge
 	}
 }
 
+void FBongLodgeModule::Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& InP, bool bStartEnforce)
+{
+	FBongLodgePlacement P = InP;
+	FitToMonitors(P);
+	UE_LOG(LogBongLodge, Log, TEXT("Apply: saved (%d,%d %dx%d max=%d min=%d) -> fitted (%d,%d %dx%d)"), InP.X, InP.Y, InP.W, InP.H, InP.bMaximized, InP.bMinimized, P.X, P.Y, P.W, P.H);
+	ApplyFitted(Window, P);
+	if (bStartEnforce)
+	{
+		Enforce(Window, P);
+	}
+}
+
+void FBongLodgeModule::Enforce(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& Fitted)
+{
+	FEnforce E;
+	E.Window = Window;
+	E.Target = Fitted;
+	E.Until = FPlatformTime::Seconds() + 6.0;
+	Enforced.Add(E);
+}
+
+bool FBongLodgeModule::IsEnforced(const SWindow* Window) const
+{
+	for (const FEnforce& E : Enforced)
+	{
+		if (E.Window.Pin().Get() == Window) { return true; }
+	}
+	return false;
+}
+
 // ---------------------------------------------------------------- events
 
 void FBongLodgeModule::OnMainFrameCreated(TSharedPtr<SWindow> Root, bool bNewProjectWindow)
@@ -229,6 +270,7 @@ void FBongLodgeModule::OnMainFrameCreated(TSharedPtr<SWindow> Root, bool bNewPro
 	{
 		return;
 	}
+	UE_LOG(LogBongLodge, Log, TEXT("MainFrame created, root at (%.0f,%.0f) visible=%d"), Root->GetPositionInScreen().X, Root->GetPositionInScreen().Y, Root->IsVisible());
 	if (const FBongLodgePlacement* P = Placements.Find(BONGLODGE_ROOT_KEY))
 	{
 		Apply(Root.ToSharedRef(), *P);
@@ -239,6 +281,29 @@ void FBongLodgeModule::OnMainFrameCreated(TSharedPtr<SWindow> Root, bool bNewPro
 
 void FBongLodgeModule::OnPreTick(float Dt)
 {
+	const double NowE = FPlatformTime::Seconds();
+	for (int32 i = Enforced.Num() - 1; i >= 0; --i)
+	{
+		FEnforce& E = Enforced[i];
+		TSharedPtr<SWindow> W = E.Window.Pin();
+		if (!W.IsValid() || NowE > E.Until || E.Corrections >= 5)
+		{
+			Enforced.RemoveAtSwap(i);
+			continue;
+		}
+		FBongLodgePlacement Cur;
+		if (!Capture(W.ToSharedRef(), Cur)) { continue; }
+		const bool bOff = FMath::Abs(Cur.X - E.Target.X) > 8 || FMath::Abs(Cur.Y - E.Target.Y) > 8
+			|| (!E.Target.bMaximized && (FMath::Abs(Cur.W - E.Target.W) > 8 || FMath::Abs(Cur.H - E.Target.H) > 8))
+			|| Cur.bMaximized != E.Target.bMaximized || Cur.bMinimized != E.Target.bMinimized;
+		if (bOff)
+		{
+			UE_LOG(LogBongLodge, Log, TEXT("Window was moved by someone else to (%d,%d max=%d) during startup, re-applying (%d,%d)"), Cur.X, Cur.Y, Cur.bMaximized, E.Target.X, E.Target.Y);
+			ApplyFitted(W.ToSharedRef(), E.Target);
+			++E.Corrections;
+		}
+	}
+
 	FSlateApplication& App = FSlateApplication::Get();
 	TArray<TSharedRef<SWindow>> Windows = App.GetTopLevelWindows();
 	// floating tab windows are children of the root window
@@ -273,11 +338,19 @@ void FBongLodgeModule::OnPreTick(float Dt)
 		}
 		if (bCaptureNow)
 		{
+			if (IsEnforced(&Window.Get()))
+			{
+				continue; // don't record startup moves
+			}
 			const FString* Key = KeyCache.Find(&Window.Get());
 			FBongLodgePlacement Cur;
 			if (Key && Capture(Window, Cur))
 			{
 				FBongLodgePlacement& Old = Placements.FindOrAdd(*Key);
+				if (Old.X != Cur.X || Old.Y != Cur.Y)
+				{
+					UE_LOG(LogBongLodge, Log, TEXT("%s moved to (%d,%d %dx%d max=%d)"), **Key, Cur.X, Cur.Y, Cur.W, Cur.H, Cur.bMaximized);
+				}
 				if (Old.X != Cur.X || Old.Y != Cur.Y || Old.W != Cur.W || Old.H != Cur.H || Old.bMaximized != Cur.bMaximized || Old.bMinimized != Cur.bMinimized)
 				{
 					Old = Cur;

@@ -27,7 +27,8 @@ private:
 
 	FString GetWindowKey(const TSharedRef<SWindow>& Window) const;
 	bool Capture(const TSharedRef<SWindow>& Window, FBongLodgePlacement& Out) const;
-	void Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P);
+	void Apply(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P, bool bStartEnforce = true);
+	static void ApplyFitted(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& P);
 	static void FitToMonitors(FBongLodgePlacement& P);
 
 	void Load();
@@ -36,6 +37,14 @@ private:
 	TMap<FString, FBongLodgePlacement> Placements;
 	TSet<TWeakPtr<SWindow>> Handled;   // windows already restored / being tracked
 	TMap<const SWindow*, FString> KeyCache;
+
+	// After we place a window, the editor may still move it once more during startup
+	// (observed in 5.7: windows shifted to another monitor ~0.2-0.6 s after first show).
+	// For a short grace period we re-apply the target and do not record those moves.
+	struct FEnforce { TWeakPtr<SWindow> Window; FBongLodgePlacement Target; double Until = 0.0; int32 Corrections = 0; };
+	TArray<FEnforce> Enforced;
+	void Enforce(const TSharedRef<SWindow>& Window, const FBongLodgePlacement& Fitted);
+	bool IsEnforced(const SWindow* Window) const;
 	FDelegateHandle PreTickHandle, DestroyHandle, MainFrameHandle;
 	double LastSaveCheck = 0.0;
 	bool bDirty = false;
