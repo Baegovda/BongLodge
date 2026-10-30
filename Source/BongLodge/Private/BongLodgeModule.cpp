@@ -29,6 +29,13 @@ public:
 	// Minimized targets: rects (as created from layout/RootWindow) whose first show is suppressed so the
 	// window never paints in normal state; BongLodge then shows it directly as minimized.
 	TArray<RECT> PendingMinRects;
+	// 6.1/6.4: saved normal rects. On a window's first show, a rect within a few px of one of these
+	// (engine border/DPI rounding: e.g. 1920x2100 -> 1922x2102 at 125%) is snapped to the exact rect
+	// before anything is painted.
+	TArray<RECT> PendingExactRects;
+	TSet<HWND> SeenExact;
+	// windows the user started to move/size (title-bar drag); enforcement stops for them
+	TSet<HWND> UserMoved;
 	TSet<HWND> SuppressedShow;
 	TSet<HWND> SeenShow;
 	double DiagUntil = 0.0;
@@ -44,6 +51,7 @@ public:
 		if (Msg == WM_ENTERSIZEMOVE)
 		{
 			Targets.Remove(Hwnd); // user starts dragging: stop guarding this window
+			UserMoved.Add(Hwnd);
 			return false;
 		}
 		if (Msg == WM_SIZE && WParam == SIZE_RESTORED && FPlatformTime::Seconds() < DiagUntil && !bOwnChange)
@@ -75,6 +83,33 @@ public:
 						SP->flags &= ~SWP_SHOWWINDOW;
 						SuppressedShow.Add(Hwnd);
 						UE_LOG(LogBongLodgeGuard, Log, TEXT("Suppressed first show of window to be minimized (%d,%d)"), (int32)New.left, (int32)New.top);
+						break;
+					}
+				}
+			}
+		}
+		if (Msg == WM_WINDOWPOSCHANGING && !bOwnChange && PendingExactRects.Num() > 0 && !UserMoved.Contains(Hwnd) && !SuppressedShow.Contains(Hwnd))
+		{
+			// During the startup grace, every size/move/show of a normal window that lands within a few px
+			// of a saved exact rect is snapped to it (the engine's border/DPI rounding can arrive in the
+			// first show OR in a later reshape before the first paint).
+			WINDOWPOS* SP = reinterpret_cast<WINDOWPOS*>(LParam);
+			if (SP && !::IsZoomed(Hwnd) && !::IsIconic(Hwnd) && SP->x > -30000 && ((SP->flags & SWP_SHOWWINDOW) || !(SP->flags & SWP_NOSIZE) || !(SP->flags & SWP_NOMOVE)))
+			{
+				const bool bFirst = !SeenExact.Contains(Hwnd);
+				SeenExact.Add(Hwnd);
+				RECT Cur; ::GetWindowRect(Hwnd, &Cur);
+				RECT New = Cur;
+				if (!(SP->flags & SWP_NOMOVE)) { New.left = SP->x; New.top = SP->y; New.right = SP->x + (Cur.right - Cur.left); New.bottom = SP->y + (Cur.bottom - Cur.top); }
+				if (!(SP->flags & SWP_NOSIZE)) { New.right = New.left + SP->cx; New.bottom = New.top + SP->cy; }
+				for (const RECT& R : PendingExactRects)
+				{
+					if (RectNear(R, New, 6) && !(R.left == New.left && R.top == New.top && R.right == New.right && R.bottom == New.bottom))
+					{
+						SP->x = R.left; SP->y = R.top; SP->cx = R.right - R.left; SP->cy = R.bottom - R.top;
+						SP->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+						UE_LOG(LogBongLodgeGuard, Log, TEXT("%s snapped (%d,%d %dx%d) -> exact (%d,%d %dx%d)"), bFirst ? TEXT("First show") : TEXT("Startup reshape"),
+							(int32)New.left, (int32)New.top, (int32)(New.right - New.left), (int32)(New.bottom - New.top), (int32)R.left, (int32)R.top, (int32)(R.right - R.left), (int32)(R.bottom - R.top));
 						break;
 					}
 				}
@@ -134,6 +169,68 @@ public:
 		return false; // let default processing continue with the neutralised WINDOWPOS
 	}
 };
+
+// 6.1/6.4: the engine's own message handlers are only reached once FWindowsApplication knows the
+// HWND, so the first show of a floating window can slip past FBongLodgeMessageGuard. During the
+// startup grace a thread-local CBT hook fixes the creation rect and subclasses each new UnrealWindow
+// so WM_WINDOWPOSCHANGING always goes through the guard first.
+static FBongLodgeMessageGuard* GBongLodgeGuard = nullptr;
+static HHOOK GBongLodgeCbtHook = nullptr;
+static TMap<HWND, WNDPROC> GBongLodgeOrigProcs;
+
+static LRESULT CALLBACK BongLodgeSubProc(HWND H, UINT M, WPARAM W, LPARAM L)
+{
+	const WNDPROC* Found = GBongLodgeOrigProcs.Find(H);
+	const WNDPROC Orig = Found ? *Found : nullptr;
+	if (M == WM_WINDOWPOSCHANGING && GBongLodgeGuard)
+	{
+		int32 Ignored = 0;
+		GBongLodgeGuard->ProcessMessage(H, M, W, L, Ignored);
+	}
+	if (M == WM_NCDESTROY)
+	{
+		GBongLodgeOrigProcs.Remove(H);
+		if (Orig) { ::SetWindowLongPtrW(H, GWLP_WNDPROC, (LONG_PTR)Orig); }
+	}
+	return Orig ? ::CallWindowProcW(Orig, H, M, W, L) : ::DefWindowProcW(H, M, W, L);
+}
+
+static LRESULT CALLBACK BongLodgeCbtProc(int Code, WPARAM W, LPARAM L)
+{
+	if (Code == HCBT_CREATEWND && GBongLodgeGuard)
+	{
+		HWND H = (HWND)W;
+		CBT_CREATEWNDW* C = reinterpret_cast<CBT_CREATEWNDW*>(L);
+		WCHAR Cls[64] = { 0 };
+		::GetClassNameW(H, Cls, 63);
+		if (C && C->lpcs && !(C->lpcs->style & WS_CHILD) && FCString::Strcmp(Cls, TEXT("UnrealWindow")) == 0)
+		{
+			CREATESTRUCTW* CS = C->lpcs;
+			if (CS->x != CW_USEDEFAULT && !(CS->style & WS_MAXIMIZE))
+			{
+				const RECT New = { CS->x, CS->y, CS->x + CS->cx, CS->y + CS->cy };
+				for (const RECT& R : GBongLodgeGuard->PendingExactRects)
+				{
+					if (FBongLodgeMessageGuard::RectNear(R, New, 6) && !(R.left == New.left && R.top == New.top && R.right == New.right && R.bottom == New.bottom))
+					{
+						UE_LOG(LogBongLodgeGuard, Log, TEXT("Creation rect snapped (%d,%d %dx%d) -> exact (%d,%d %dx%d)"), CS->x, CS->y, CS->cx, CS->cy,
+							(int32)R.left, (int32)R.top, (int32)(R.right - R.left), (int32)(R.bottom - R.top));
+						CS->x = R.left; CS->y = R.top; CS->cx = R.right - R.left; CS->cy = R.bottom - R.top;
+						break;
+					}
+				}
+			}
+			const WNDPROC Orig = (WNDPROC)::SetWindowLongPtrW(H, GWLP_WNDPROC, (LONG_PTR)&BongLodgeSubProc);
+			if (Orig) { GBongLodgeOrigProcs.Add(H, Orig); }
+		}
+	}
+	return ::CallNextHookEx(GBongLodgeCbtHook, Code, W, L);
+}
+
+static void BongLodgeRemoveCbtHook()
+{
+	if (GBongLodgeCbtHook) { ::UnhookWindowsHookEx(GBongLodgeCbtHook); GBongLodgeCbtHook = nullptr; }
+}
 #else
 class FBongLodgeMessageGuard {};
 #endif
@@ -183,13 +280,20 @@ void FBongLodgeModule::StartupModule()
 		MessageGuard = MakeUnique<FBongLodgeMessageGuard>();
 		static_cast<FWindowsApplication*>(PlatformApp.Get())->AddMessageHandler(*MessageGuard);
 		MessageGuard->DiagUntil = TNumericLimits<double>::Max();
+		GBongLodgeGuard = MessageGuard.Get();
+		GBongLodgeCbtHook = ::SetWindowsHookExW(WH_CBT, &BongLodgeCbtProc, nullptr, ::GetCurrentThreadId());
+		UE_LOG(LogBongLodgeGuard, Log, TEXT("Startup CBT hook %s"), GBongLodgeCbtHook ? TEXT("installed") : TEXT("FAILED"));
 		for (const auto& Pair : Placements)
 		{
-			if (Pair.Value.bMinimized)
+			FBongLodgePlacement P = Pair.Value;
+			FitToMonitors(P);
+			if (P.bMinimized)
 			{
-				FBongLodgePlacement P = Pair.Value;
-				FitToMonitors(P);
 				MessageGuard->PendingMinRects.Add({ P.X, P.Y, P.X + P.W, P.Y + P.H });
+			}
+			else if (!P.bMaximized)
+			{
+				MessageGuard->PendingExactRects.Add({ P.X, P.Y, P.X + P.W, P.Y + P.H });
 			}
 		}
 	}
@@ -209,6 +313,8 @@ void FBongLodgeModule::ShutdownModule()
 		FSlateApplication::Get().OnWindowBeingDestroyed().Remove(DestroyHandle);
 		FSlateApplication::Get().OnSystemSignalsDPIChanged().Remove(DpiHandle);
 #if PLATFORM_WINDOWS
+		BongLodgeRemoveCbtHook();
+		GBongLodgeGuard = nullptr;
 		if (MessageGuard.IsValid())
 		{
 			if (TSharedPtr<GenericApplication> PlatformApp = FSlateApplication::Get().GetPlatformApplication())
@@ -603,6 +709,14 @@ void FBongLodgeModule::HandleNewWindow(const TSharedRef<SWindow>& Window)
 	}
 	Handled.Add(Window);
 	KeyCache.Add(&Window.Get(), Key);
+	FSlateApplication& App = FSlateApplication::Get();
+	const bool bUserDragging = App.IsDragDropping() || App.GetPressedMouseButtons().Num() > 0;
+	if (bUserDragging && FPlatformTime::Seconds() > StartupGraceUntil)
+	{
+		// 6.6: a tab the user is undocking right now: it belongs under the cursor, do not move it.
+		UE_LOG(LogBongLodge, Log, TEXT("%s created by drag-undock, left where the user put it"), *Key);
+		return;
+	}
 	if (const FBongLodgePlacement* P = Placements.Find(Key))
 	{
 		Apply(Window, *P);
@@ -644,6 +758,12 @@ void FBongLodgeModule::OnPreTick(float Dt)
 		MessageGuard->SuppressedShow.Reset();
 		MessageGuard->PendingMinRects.Reset();
 	}
+	if (MessageGuard.IsValid() && MessageGuard->PendingExactRects.Num() > 0 && FPlatformTime::Seconds() > StartupGraceUntil)
+	{
+		MessageGuard->PendingExactRects.Reset();
+		MessageGuard->SeenExact.Reset();
+		BongLodgeRemoveCbtHook();
+	}
 #endif
 
 	const double NowE = FPlatformTime::Seconds();
@@ -657,7 +777,14 @@ void FBongLodgeModule::OnPreTick(float Dt)
 			continue;
 		}
 		// The user touched the editor (mouse/keyboard): stop fighting, they are in control now.
-		if (FSlateApplication::Get().GetLastUserInteractionTime() > E.StartTime)
+		bool bUserMoved = false;
+#if PLATFORM_WINDOWS
+		if (MessageGuard.IsValid() && W.IsValid() && W->GetNativeWindow().IsValid())
+		{
+			bUserMoved = MessageGuard->UserMoved.Contains((HWND)W->GetNativeWindow()->GetOSWindowHandle());
+		}
+#endif
+		if (bUserMoved || FSlateApplication::Get().GetLastUserInteractionTime() > E.StartTime)
 		{
 			Enforced.RemoveAtSwap(i);
 			continue;
@@ -742,6 +869,19 @@ void FBongLodgeModule::OnPreTick(float Dt)
 			if (IsEnforced(&Window.Get()))
 			{
 				continue; // don't record startup moves
+			}
+			if (FString* Cached = KeyCache.Find(&Window.Get()))
+			{
+				if (*Cached != BONGLODGE_ROOT_KEY)
+				{
+					const FString Fresh = GetWindowKey(Window);
+					if (!Fresh.IsEmpty() && Fresh != *Cached)
+					{
+						// tabs were moved into/out of this window: from now on it is saved under its new tab set
+						UE_LOG(LogBongLodge, Log, TEXT("Window identity changed %s -> %s"), **Cached, *Fresh);
+						*Cached = Fresh;
+					}
+				}
 			}
 			const FString* Key = KeyCache.Find(&Window.Get());
 			FBongLodgePlacement Cur;
@@ -858,7 +998,12 @@ FString FBongLodgeModule::RewriteAreasFromSaved(const FString& Layout) const
 		if (Ids.Num() == 0) { continue; }
 		Ids.Sort();
 		const FBongLodgePlacement* Saved = Placements.Find(TEXT("Tabs:") + FString::Join(Ids, TEXT("|")));
-		if (!Saved) { continue; }
+		if (!Saved)
+		{
+			// 6.5 diagnostics: floating area whose tab set has no saved placement (identity mismatch)
+			UE_LOG(LogBongLodge, Log, TEXT("Layout area [%s] has no saved placement (left as the engine saved it)"), *FString::Join(Ids, TEXT("|")));
+			continue;
+		}
 		FBongLodgePlacement P = *Saved;
 		FitToMonitors(P);
 		const float Dpi = FMath::Max(0.5f, FPlatformApplicationMisc::GetDPIScaleFactorAtPoint(P.X + P.W * 0.5f, P.Y + P.H * 0.5f));
