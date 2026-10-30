@@ -235,6 +235,7 @@ static void BongLodgeRemoveCbtHook()
 class FBongLodgeMessageGuard {};
 #endif
 #include "Misc/Paths.h"
+#include "Misc/CoreDelegates.h"
 #include "Styling/CoreStyle.h"
 #include "Styling/SlateTypes.h"
 #include "Dom/JsonObject.h"
@@ -303,10 +304,12 @@ void FBongLodgeModule::StartupModule()
 
 	IMainFrameModule& MainFrame = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
 	MainFrameHandle = MainFrame.OnMainFrameCreationFinished().AddRaw(this, &FBongLodgeModule::OnMainFrameCreated);
+	PreExitHandle = FCoreDelegates::OnPreExit.AddRaw(this, &FBongLodgeModule::RewriteLayoutOnExit);
 }
 
 void FBongLodgeModule::ShutdownModule()
 {
+	FCoreDelegates::OnPreExit.Remove(PreExitHandle);
 	if (FSlateApplication::IsInitialized())
 	{
 		FSlateApplication::Get().OnPreTick().Remove(PreTickHandle);
@@ -857,6 +860,30 @@ void FBongLodgeModule::OnPreTick(float Dt)
 	const double Now = FPlatformTime::Seconds();
 	const bool bCaptureNow = (Now - LastSaveCheck) > 0.5;
 
+	// 6.5: an external tool that matches windows by process (DisplayFusion window position profile) moves
+	// the main window AND every floating tab window onto the very same rect at once. Detect windows that
+	// share an identical rect with another of our windows and don't record them.
+	TMap<const SWindow*, FBongLodgePlacement> BulkCur;
+	if (bCaptureNow)
+	{
+		TArray<TPair<const SWindow*, FBongLodgePlacement>> All;
+		for (const TSharedRef<SWindow>& Window : Windows)
+		{
+			FBongLodgePlacement P;
+			if (Handled.Contains(Window) && KeyCache.Contains(&Window.Get()) && Capture(Window, P)) { All.Emplace(&Window.Get(), P); }
+		}
+		for (int32 a = 0; a < All.Num(); ++a)
+		{
+			for (int32 b = a + 1; b < All.Num(); ++b)
+			{
+				const FBongLodgePlacement& A = All[a].Value; const FBongLodgePlacement& B = All[b].Value;
+				if (A.X == B.X && A.Y == B.Y && A.W == B.W && A.H == B.H && !A.bMinimized && !B.bMinimized)
+				{
+					BulkCur.Add(All[a].Key, A); BulkCur.Add(All[b].Key, B);
+				}
+			}
+		}
+	}
 	for (const TSharedRef<SWindow>& Window : Windows)
 	{
 		if (!Handled.Contains(Window))
@@ -866,6 +893,24 @@ void FBongLodgeModule::OnPreTick(float Dt)
 		}
 		if (bCaptureNow)
 		{
+			if (const FString* BK = KeyCache.Find(&Window.Get()))
+			{
+				if (BulkCur.Contains(&Window.Get()))
+				{
+					if (!BulkMovedKeys.Contains(*BK))
+					{
+						const FBongLodgePlacement& P = BulkCur[&Window.Get()];
+						UE_LOG(LogBongLodge, Log, TEXT("%s shares an identical rect (%d,%d %dx%d max=%d) with another editor window: external bulk move, not recorded"), **BK, P.X, P.Y, P.W, P.H, P.bMaximized);
+						BulkMovedKeys.Add(*BK);
+					}
+					PendingMoves.Remove(*BK);
+					continue;
+				}
+				else if (BulkMovedKeys.Remove(*BK) > 0)
+				{
+					UE_LOG(LogBongLodge, Log, TEXT("%s no longer shares a rect, recording resumes"), **BK);
+				}
+			}
 			if (IsEnforced(&Window.Get()))
 			{
 				continue; // don't record startup moves
@@ -895,9 +940,26 @@ void FBongLodgeModule::OnPreTick(float Dt)
 				}
 				if (Old.X != Cur.X || Old.Y != Cur.Y || Old.W != Cur.W || Old.H != Cur.H || Old.bMaximized != Cur.bMaximized || Old.bMinimized != Cur.bMinimized)
 				{
-					Old = Cur;
-					TouchedKeys.Add(*Key);
-					bDirty = true;
+					// 6.5: commit only after the new placement stayed unchanged for 1.5 s, so the transient states
+					// of an external bulk move (windows moved one after another, maximize/restore) never get saved
+					TPair<FBongLodgePlacement, double>* Pend = PendingMoves.Find(*Key);
+					const FBongLodgePlacement* PP = Pend ? &Pend->Key : nullptr;
+					const bool bSame = PP && PP->X == Cur.X && PP->Y == Cur.Y && PP->W == Cur.W && PP->H == Cur.H && PP->bMaximized == Cur.bMaximized && PP->bMinimized == Cur.bMinimized;
+					if (!bSame)
+					{
+						PendingMoves.Add(*Key, TPair<FBongLodgePlacement, double>(Cur, Now));
+					}
+					else if (Now - Pend->Value >= 1.5)
+					{
+						Old = Cur;
+						PendingMoves.Remove(*Key);
+						TouchedKeys.Add(*Key);
+						bDirty = true;
+					}
+				}
+				else
+				{
+					PendingMoves.Remove(*Key);
 				}
 			}
 		}
@@ -913,8 +975,19 @@ void FBongLodgeModule::OnWindowBeingDestroyed(const SWindow& Window)
 {
 	if (const FString* Key = KeyCache.Find(&Window))
 	{
+		if (BulkMovedKeys.Remove(*Key) > 0)
+		{
+			UE_LOG(LogBongLodge, Log, TEXT("%s closed while bulk-moved by an external tool: keeping the previous saved placement"), **Key);
+			KeyCache.Remove(&Window);
+			for (auto It = Handled.CreateIterator(); It; ++It)
+			{
+				if (!It->IsValid() || It->Pin().Get() == &Window) { It.RemoveCurrent(); }
+			}
+			return;
+		}
 		FBongLodgePlacement Cur;
 		TSharedRef<SWindow> Ref = ConstCastSharedRef<SWindow>(StaticCastSharedRef<const SWindow>(Window.AsShared()));
+		PendingMoves.Remove(*Key);
 		if (Capture(Ref, Cur))
 		{
 			BongLodgeKeepNormalRect(Ref, Cur, Placements.Find(*Key));
@@ -1022,6 +1095,28 @@ FString FBongLodgeModule::RewriteAreasFromSaved(const FString& Layout) const
 	return Text;
 }
 
+/** 6.5: the engine saves each floating window's current rect into EditorLayout.ini on exit. If an
+ *  external tool had just moved the windows (bulk move, not recorded by BongLodge) the next launch would
+ *  first create the window at that rect. Re-write the floating areas from BongLodge's placements. */
+void FBongLodgeModule::RewriteLayoutOnExit()
+{
+	if (!GConfig) { return; }
+	FString SectionName;
+	GConfig->GetString(TEXT("Slate"), TEXT("EditorLayoutsSectionName"), SectionName, GEditorIni);
+	SectionName.TrimStartAndEndInline();
+	if (SectionName.IsEmpty()) { SectionName = TEXT("EditorLayouts"); }
+	const FConfigSection* Section = GConfig->GetSection(*SectionName, false, GEditorLayoutIni);
+	if (!Section) { return; }
+	TArray<TPair<FString, FString>> Updates;
+	for (const auto& Pair : *Section)
+	{
+		const FString New = RewriteAreasFromSaved(Pair.Value.GetValue());
+		if (!New.Equals(Pair.Value.GetValue(), ESearchCase::CaseSensitive)) { Updates.Add(TPair<FString, FString>(Pair.Key.ToString(), New)); }
+	}
+	for (const auto& U : Updates) { GConfig->SetString(*SectionName, *U.Key, *U.Value, GEditorLayoutIni); }
+	if (Updates.Num() > 0) { GConfig->Flush(false, GEditorLayoutIni); }
+	UE_LOG(LogBongLodge, Log, TEXT("On exit: %d saved layout(s) re-written from BongLodge placements"), Updates.Num());
+}
 void FBongLodgeModule::PrepareConfigBeforeLayoutLoad()
 {
 	if (!GConfig)

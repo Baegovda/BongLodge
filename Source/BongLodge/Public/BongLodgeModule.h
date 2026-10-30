@@ -32,6 +32,8 @@ private:
 	 *  and pull off-screen floating areas of the saved layouts back onto a connected monitor. */
 	void PrepareConfigBeforeLayoutLoad();
 	FString RewriteAreasFromSaved(const FString& Layout) const;
+	void RewriteLayoutOnExit();
+	FDelegateHandle PreExitHandle;
 
 	// Startup: WM_DPICHANGED is deferred by FWindowsApplication and then applied with a stale
 	// suggested rect, which throws freshly placed windows onto another monitor. During startup we
@@ -58,6 +60,8 @@ private:
 
 	TMap<FString, FBongLodgePlacement> Placements;
 	TSet<FString> TouchedKeys; // keys changed by this editor instance
+	TMap<FString, TPair<FBongLodgePlacement, double>> PendingMoves; // a move is recorded only once it stayed put for 1.5 s
+	TSet<FString> BulkMovedKeys; // 6.5: windows moved together onto one identical rect by an external tool (e.g. a DisplayFusion process-wide profile); not recorded
 	TSet<TWeakPtr<SWindow>> Handled;   // windows already restored / being tracked
 	TMap<const SWindow*, FString> KeyCache;
 
